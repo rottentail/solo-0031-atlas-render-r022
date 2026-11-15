@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -98,14 +99,237 @@ class Demo:
             time.sleep(.025)
         raise RuntimeError('render deadline exceeded')
 
+    def raw(self, method, path, body=None, headers=None):
+        hdr = dict(headers or {})
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+            hdr['Content-Type'] = 'application/json'
+        request = urllib.request.Request(self.url + path, data=body, method=method, headers=hdr)
+        try:
+            response = urllib.request.urlopen(request, timeout=15)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            data = response.read()
+            if response.headers.get('Content-Type', '').startswith('application/json'):
+                data = json.loads(data)
+            return response.status, data
+
     def submit(self, snapshot, key='render-one', scale=1):
         return self.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': scale}, 202, {'Idempotency-Key': key})
+
+
+def merge_scene_edits(demo, d, put):
+    """Edit individual layers, surface real conflicts, and freeze one revision."""
+    def layer(doc, ident):
+        stack = list(doc['layers'])
+        while stack:
+            candidate = stack.pop()
+            if candidate['id'] == ident:
+                return candidate
+            stack.extend(candidate.get('children', []))
+        raise AssertionError(ident)
+
+    def patch(edit, status=200):
+        return demo.call('PATCH', '/v1/scenes/emblem', edit, status)
+
+    def order(doc, parent=''):
+        layers = doc['layers'] if not parent else layer(doc, parent)['children']
+        return [l['id'] for l in layers]
+
+    def snapshots():
+        return demo.call('GET', '/v1/status')['snapshotCount']
+
+    base = demo.call('GET', '/v1/scenes/emblem')['revision']
+    assert base == 1
+
+    # Two editors read revision 1. Their layer-scoped edits merge because they
+    # touch different layers.
+    accent = dict(layer(d, 'accent'), fill={'kind': 'solid', 'color': '#223344'})
+    first = patch({'expectedRevision': base, 'layers': [{'layer': accent}]})
+    assert first['scene']['revision'] == 2 and first['merged'] is False
+    plate = dict(layer(d, 'plate'))
+    plate['transform'] = {'x': 45, 'y': 35, 'scaleX': 1, 'scaleY': 1, 'degrees': 20}
+    second = patch({'expectedRevision': base, 'layers': [{'layer': plate}]})
+    assert second['scene']['revision'] == 3 and second['merged'] is True
+    current = demo.call('GET', '/v1/scenes/emblem')
+    assert layer(current['document'], 'accent')['fill']['color'] == '#223344', 'unrelated edit was lost'
+    assert layer(current['document'], 'plate')['transform']['degrees'] == 20
+
+    # Same-layer changes are never silently overwritten.
+    status, failed = demo.raw('PATCH', '/v1/scenes/emblem', {'expectedRevision': base, 'deleteLayers': ['accent']})
+    assert status == 409 and failed['details']['currentRevision'] == 3
+    assert failed['details']['conflicts'][0]['layer'] == 'accent'
+    assert failed['details']['conflicts'][0]['reason'] == 'layer-modified'
+    retargeted = dict(plate, transform={'x': 45, 'y': 35, 'scaleX': 1, 'scaleY': 1, 'degrees': 45})
+    status, failed = demo.raw('PATCH', '/v1/scenes/emblem', {'expectedRevision': 2, 'layers': [{'layer': retargeted}]})
+    assert status == 409 and failed['details']['conflicts'][0]['field'] == 'transform'
+    assert demo.call('GET', '/v1/scenes/emblem')['revision'] == 3
+    assert layer(demo.call('GET', '/v1/scenes/emblem')['document'], 'plate')['transform']['degrees'] == 20
+
+    # Reordering siblings from a stale base is a conflict; applying it once
+    # from the current base succeeds and keeps the other editors' layering.
+    swapped = patch({'expectedRevision': 3, 'order': [{'layerIds': ['accent', 'plate', 'inset']}]})
+    assert swapped['scene']['revision'] == 4
+    status, failed = demo.raw('PATCH', '/v1/scenes/emblem', {'expectedRevision': 3, 'order': [{'layerIds': ['inset', 'accent', 'plate']}]})
+    assert status == 409 and failed['details']['conflicts'][0]['reason'] == 'order-modified'
+
+    # A new layer based on a stale revision is appended without disturbing the
+    # committed order.
+    glow = {'id': 'glow', 'kind': 'ellipse', 'width': 40, 'height': 40,
+            'transform': {'x': 10, 'y': 10, 'scaleX': 1, 'scaleY': 1},
+            'opacity': .5, 'fill': {'kind': 'solid', 'color': '#FFFFFF'}}
+    inserted = patch({'expectedRevision': 3, 'layers': [{'layer': glow}]})
+    assert inserted['scene']['revision'] == 5 and inserted['merged'] is True
+    assert order(inserted['scene']['document']) == ['accent', 'plate', 'inset', 'glow']
+
+    # Replaying the same layer edit is idempotent rather than a new revision.
+    replay = patch({'expectedRevision': base, 'layers': [{'layer': plate}]})
+    assert replay['scene']['revision'] == 5
+    assert order(replay['scene']['document']) == ['accent', 'plate', 'inset', 'glow']
+
+    # Group-local edits merge with concurrent edits below the group: the stale
+    # inline children never overwrite the committed child layer.
+    facet = dict(layer(d, 'facet'), opacity=.6)
+    nested = patch({'expectedRevision': base, 'layers': [{'layer': facet}]})
+    assert nested['merged'] is True
+    inset = dict(layer(d, 'inset'), transform={'x': 150, 'y': 100, 'scaleX': 1, 'scaleY': 1, 'degrees': 3})
+    group = patch({'expectedRevision': base, 'layers': [{'layer': inset}]})
+    merged_doc = group['scene']['document']
+    assert layer(merged_doc, 'facet')['opacity'] == .6, 'stale group overwrote a nested edit'
+    assert layer(merged_doc, 'inset')['transform']['degrees'] == 3
+    assert layer(merged_doc, 'inset')['children'][0]['id'] == 'facet'
+    revision = group['scene']['revision']
+
+    # A nested layer can be created and moved inside a group, and moving a
+    # group into its own subtree is rejected outright.
+    spark = {'id': 'spark', 'kind': 'rectangle', 'width': 12, 'height': 12,
+             'transform': {'scaleX': 1, 'scaleY': 1}, 'opacity': 1,
+             'fill': {'kind': 'solid', 'color': '#FFE082'}}
+    added = patch({'expectedRevision': revision,
+                   'layers': [{'layer': spark, 'parentId': 'inset'}], 'order': [
+                       {'parentId': 'inset', 'layerIds': ['facet', 'spark']}]})
+    assert [c['id'] for c in layer(added['scene']['document'], 'inset')['children']] == ['facet', 'spark']
+    revision = added['scene']['revision']
+    status, failed = demo.raw('PATCH', '/v1/scenes/emblem', {'expectedRevision': revision,
+                          'layers': [{'layer': layer(added['scene']['document'], 'inset'), 'parentId': 'facet'}]})
+    assert status == 400, failed
+    moved = patch({'expectedRevision': revision,
+                   'layers': [{'layer': layer(added['scene']['document'], 'spark'), 'parentId': ''}]})
+    assert order(moved['scene']['document']) == ['accent', 'plate', 'inset', 'glow', 'spark']
+    revision = moved['scene']['revision']
+
+    # Two editors creating the same new layer id with different content cannot
+    # be combined; the committed layer stays untouched.
+    rival = dict(spark, id='badge', fill={'kind': 'solid', 'color': '#111111'})
+    opponent = dict(spark, id='badge', fill={'kind': 'solid', 'color': '#222222'})
+    first_badge = patch({'expectedRevision': revision, 'layers': [{'layer': rival, 'parentId': 'inset'}]})
+    revision = first_badge['scene']['revision']
+    status, failed = demo.raw('PATCH', '/v1/scenes/emblem', {'expectedRevision': revision - 1,
+                          'layers': [{'layer': opponent, 'parentId': 'inset'}]})
+    assert status == 409 and failed['details']['conflicts'][0]['reason'] == 'layer-created', failed
+
+    # Parallel editors all branch from the same revision. The store commits one
+    # edit at a time and the merge must preserve every contributor.
+    start = demo.call('GET', '/v1/scenes/emblem')
+    stripe_ids = [f'stripe-{i}' for i in range(6)]
+    edits = [{'expectedRevision': start['revision'],
+              'layers': [{'layer': {'id': ident, 'kind': 'rectangle', 'width': 8, 'height': 8,
+                                    'transform': {'scaleX': 1, 'scaleY': 1}, 'opacity': .4,
+                                    'fill': {'kind': 'solid', 'color': '#%02X%02X40' % (32 + 24 * i, 40)}}}]}
+             for i, ident in enumerate(stripe_ids)]
+    with ThreadPoolExecutor(max_workers=len(edits)) as pool:
+        outcomes = list(pool.map(lambda edit: demo.raw('PATCH', '/v1/scenes/emblem', edit), edits))
+    assert all(status == 200 for status, _ in outcomes), outcomes
+    parallel = demo.call('GET', '/v1/scenes/emblem')
+    assert all(layer(parallel['document'], ident) for ident in stripe_ids), 'concurrent edit was lost'
+    assert revision + len(edits) == parallel['revision']
+    revision = parallel['revision']
+
+    # Two freeze-with-edit requests race from the same observed revision: the
+    # winner commits one merged revision and one snapshot, the loser is
+    # rejected instead of freezing a revision it never saw.
+    before = snapshots()
+    race_target = layer(parallel['document'], stripe_ids[0])
+
+    def freeze_once(color):
+        edit = {'expectedRevision': revision,
+                'layers': [{'layer': dict(race_target, fill={'kind': 'solid', 'color': color})}]}
+        return demo.raw('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': revision, 'edit': edit})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(freeze_once, ['#010203', '#040506']))
+    statuses = sorted(status for status, _ in outcomes)
+    assert statuses == [201, 409], outcomes
+    assert snapshots() == before + 1, 'racing freezes produced more than one snapshot'
+    revision += 1
+    assert demo.call('GET', '/v1/scenes/emblem')['revision'] == revision
+    winner = next(body for status, body in outcomes if status == 201)
+    assert winner['revision'] == revision and winner['document'] == demo.call('GET', '/v1/scenes/emblem')['document']
+
+    # The unconditional whole-document write still rejects stale bases.
+    status, failed = demo.raw('PUT', '/v1/scenes/emblem', {'name': '旧版本', 'expectedRevision': 1, 'document': d})
+    assert status == 409
+
+    # Merge and freeze a single revision in one transaction.
+    tinted = dict(layer(demo.call('GET', '/v1/scenes/emblem')['document'], 'plate'),
+                  fill={'kind': 'linear', 'color': '#000000', 'endColor': '#FFFFFF', 'from': {'x': 0, 'y': 0}, 'to': {'x': 220, 'y': 150}})
+    frozen = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': revision,
+                        'edit': {'expectedRevision': revision, 'layers': [{'layer': tinted}]}}, 201)
+    final = demo.call('GET', '/v1/scenes/emblem')
+    revision = final['revision']
+    assert frozen['revision'] == revision
+    assert frozen['document'] == final['document'], 'snapshot mixed two revisions'
+    assert layer(frozen['document'], 'accent')['fill']['color'] == '#223344'
+    assert layer(frozen['document'], 'facet')['opacity'] == .6
+    assert frozen['digest'] == demo.call('GET', '/v1/snapshots/' + frozen['id'])['digest']
+    job = demo.wait(demo.submit(frozen)['id'])
+    png = demo.call('GET', '/v1/artifacts/' + job['artifactId'])
+    assert png[:8] == b'\x89PNG\r\n\x1a\n'
+
+    # A conflicting edit freezes nothing and keeps the other editor's change.
+    before = snapshots()
+    base_glow = layer(demo.call('GET', '/v1/scenes/emblem')['document'], 'glow')
+    prepared = dict(base_glow, opacity=.75)
+    committed = dict(base_glow, fill={'kind': 'solid', 'color': '#ABCABC'})
+    demo.call('PATCH', '/v1/scenes/emblem', {'expectedRevision': revision, 'layers': [{'layer': committed}]})
+    revision += 1
+    status, failed = demo.raw('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': revision,
+                          'edit': {'expectedRevision': revision - 1, 'layers': [{'layer': prepared}]}})
+    assert status == 409 and failed['details']['conflicts'][0]['layer'] == 'glow', failed
+    assert snapshots() == before, 'conflicting freeze left a snapshot behind'
+    assert demo.call('GET', '/v1/scenes/emblem')['revision'] == revision
+    assert layer(demo.call('GET', '/v1/scenes/emblem')['document'], 'glow')['fill']['color'] == '#ABCABC'
+    assert layer(demo.call('GET', '/v1/scenes/emblem')['document'], 'glow')['opacity'] == .5
+
+    # The same edit rebased on the committed revision freezes one new revision.
+    ready = dict(layer(demo.call('GET', '/v1/scenes/emblem')['document'], 'glow'), opacity=.75)
+    frozen = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': revision,
+                        'edit': {'expectedRevision': revision, 'layers': [{'layer': ready}]}}, 201)
+    revision += 1
+    assert frozen['revision'] == revision and frozen['document'] == demo.call('GET', '/v1/scenes/emblem')['document']
+
+    # A plain freeze of a stale revision is rejected instead of capturing a
+    # revision the caller never saw.
+    demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': revision - 1}, 409)
+    assert demo.call('GET', '/v1/scenes/emblem')['revision'] == revision
+
+    # The whole-document path remains available for complete replacements.
+    updated = demo.call('PUT', '/v1/scenes/emblem', {'name': '双色印记',
+                        'expectedRevision': revision, 'document': dict(final['document'], background='#101010')})
+    assert updated['revision'] == revision + 1 and updated['document']['background'] == '#101010'
+    events = demo.call('GET', '/v1/events')
+    assert any(e['kind'] == 'scene.edited' for e in events)
+    return {'workflow': 'merge-scene-edits', 'state': job['state'], 'revision': updated['revision'],
+            'snapshotRevision': frozen['revision'], 'conflicts': 5, 'pngBytes': len(png)}
 
 
 def run(demo, workflow, out):
     d = sample()
     put = lambda doc, rev=0: demo.call('PUT', '/v1/scenes/emblem', {'name': '双色印记', 'expectedRevision': rev, 'document': doc})
     scene = put(d)
+    if workflow == 'merge-scene-edits':
+        return merge_scene_edits(demo, d, put)
     if workflow == 'create-scene':
         assert demo.call('GET', '/v1/scenes/emblem')['document'] == scene['document']
         bad = sample(); bad['layers'][0]['transform']['scaleX'] = 0

@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const FormatVersion = 1
+const (
+	FormatVersion   = 1
+	MaxSceneHistory = 32
+)
 
 type Point struct {
 	X float64 `json:"x"`
@@ -52,6 +55,11 @@ type Document struct {
 	Height     int     `json:"height"`
 	Background string  `json:"background"`
 	Layers     []Layer `json:"layers"`
+}
+type SceneRevision struct {
+	Revision int      `json:"revision"`
+	Name     string   `json:"name"`
+	Document Document `json:"document"`
 }
 type Scene struct {
 	ID        string    `json:"id"`
@@ -112,19 +120,20 @@ type Event struct {
 	At       time.Time `json:"at"`
 }
 type State struct {
-	Version   int                 `json:"version"`
-	Scenes    map[string]Scene    `json:"scenes"`
-	Assets    map[string]Asset    `json:"assets"`
-	Snapshots map[string]Snapshot `json:"snapshots"`
-	Jobs      map[string]Job      `json:"jobs"`
-	Artifacts map[string]Artifact `json:"artifacts"`
-	Receipts  map[string]Receipt  `json:"receipts"`
-	Events    []Event             `json:"events"`
-	Sequence  int                 `json:"sequence"`
+	Version   int                        `json:"version"`
+	Scenes    map[string]Scene           `json:"scenes"`
+	Revisions map[string][]SceneRevision `json:"revisions"`
+	Assets    map[string]Asset           `json:"assets"`
+	Snapshots map[string]Snapshot        `json:"snapshots"`
+	Jobs      map[string]Job             `json:"jobs"`
+	Artifacts map[string]Artifact        `json:"artifacts"`
+	Receipts  map[string]Receipt         `json:"receipts"`
+	Events    []Event                    `json:"events"`
+	Sequence  int                        `json:"sequence"`
 }
 
 func NewState() State {
-	return State{Version: FormatVersion, Scenes: map[string]Scene{}, Assets: map[string]Asset{}, Snapshots: map[string]Snapshot{}, Jobs: map[string]Job{}, Artifacts: map[string]Artifact{}, Receipts: map[string]Receipt{}}
+	return State{Version: FormatVersion, Scenes: map[string]Scene{}, Revisions: map[string][]SceneRevision{}, Assets: map[string]Asset{}, Snapshots: map[string]Snapshot{}, Jobs: map[string]Job{}, Artifacts: map[string]Artifact{}, Receipts: map[string]Receipt{}}
 }
 func Digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func CanonicalDigest(v any) string {

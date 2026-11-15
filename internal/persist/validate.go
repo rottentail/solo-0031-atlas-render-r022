@@ -11,7 +11,7 @@ func Validate(s model.State) error {
 	if s.Version != model.FormatVersion {
 		return fmt.Errorf("unsupported state version %d", s.Version)
 	}
-	if s.Scenes == nil || s.Assets == nil || s.Snapshots == nil || s.Jobs == nil || s.Artifacts == nil || s.Receipts == nil {
+	if s.Scenes == nil || s.Assets == nil || s.Snapshots == nil || s.Jobs == nil || s.Artifacts == nil || s.Receipts == nil || s.Revisions == nil {
 		return fmt.Errorf("state maps must be present")
 	}
 	for id, v := range s.Scenes {
@@ -20,6 +20,28 @@ func Validate(s model.State) error {
 		}
 		if e := scene.Validate(v.Document); e != nil {
 			return e
+		}
+	}
+	for id, history := range s.Revisions {
+		if _, ok := s.Scenes[id]; !ok {
+			return fmt.Errorf("orphan scene revision history %s", id)
+		}
+		if len(history) > model.MaxSceneHistory {
+			return fmt.Errorf("scene revision history %s exceeds retention", id)
+		}
+		last := 0
+		for _, r := range history {
+			if r.Revision <= last {
+				return fmt.Errorf("scene revision history %s is not increasing", id)
+			}
+			last = r.Revision
+			if e := scene.Validate(r.Document); e != nil {
+				return e
+			}
+		}
+		current := s.Scenes[id]
+		if len(history) == 0 || history[len(history)-1].Revision > current.Revision {
+			return fmt.Errorf("scene revision history %s is ahead of the scene", id)
 		}
 	}
 	for id, v := range s.Assets {

@@ -101,6 +101,26 @@
       "verification": "python3 scripts/walkthrough.py --workflow revise-scene"
     },
     {
+      "id": "merge-scene-edits",
+      "name": "按图层合并场景修订",
+      "entry": "PATCH /v1/scenes/{id} + POST /v1/scenes/{id}/snapshots",
+      "success": "只提交改动的图层，保留他人已提交的无关编辑，并在同一次事务中冻结合并后的修订",
+      "failure": "同图层内容、删除或变换冲突、重排冲突和移动冲突返回409明细，且不写入场景或快照",
+      "module_ids": [
+        "httpapi",
+        "service",
+        "scene",
+        "persist"
+      ],
+      "steps": [
+        "以当前修订读取场景，分别提交不同图层的编辑并观察合并结果",
+        "用过期基线提交同图层修改、删除、重排，核对409冲突明细及文档未被覆盖",
+        "把图层编辑与冻结放进同一请求，核对快照修订与场景修订一致、冲突时不产生快照",
+        "继续使用整份文档PUT完成完整替换，核对旧修订仍返回409"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow merge-scene-edits"
+    },
+    {
       "id": "archive-scene",
       "name": "归档和恢复场景",
       "entry": "POST /v1/scenes/{id}/state",

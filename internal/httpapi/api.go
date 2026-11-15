@@ -23,7 +23,11 @@ func write(w http.ResponseWriter, status int, v any) {
 func fail(w http.ResponseWriter, e error) {
 	var de *model.Error
 	if errors.As(e, &de) {
-		write(w, de.Status, map[string]string{"code": de.Code, "error": de.Message})
+		payload := map[string]any{"code": de.Code, "error": de.Message}
+		if de.Details != nil {
+			payload["details"] = de.Details
+		}
+		write(w, de.Status, payload)
 		return
 	}
 	write(w, 500, map[string]string{"code": "internal", "error": "operation could not be committed"})
@@ -44,6 +48,7 @@ func (a API) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ready"}) })
 	m.HandleFunc("PUT /v1/scenes/{id}", a.putScene)
+	m.HandleFunc("PATCH /v1/scenes/{id}", a.editScene)
 	m.HandleFunc("GET /v1/scenes/{id}", a.getScene)
 	m.HandleFunc("POST /v1/scenes/{id}/state", a.sceneState)
 	m.HandleFunc("POST /v1/scenes/{id}/snapshots", a.freeze)

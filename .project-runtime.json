@@ -17,6 +17,10 @@
       "command": "python3 scripts/walkthrough.py --workflow revise-scene"
     },
     {
+      "workflow_id": "merge-scene-edits",
+      "command": "python3 scripts/walkthrough.py --workflow merge-scene-edits"
+    },
+    {
       "workflow_id": "archive-scene",
       "command": "python3 scripts/walkthrough.py --workflow archive-scene"
     },

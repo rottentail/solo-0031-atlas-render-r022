@@ -41,12 +41,28 @@ func Open(path string) (*Store, error) {
 			s.Close()
 			return nil, fmt.Errorf("invalid persisted JSON: %w", e)
 		}
+		upgrade(&s.state)
 		if e = Validate(s.state); e != nil {
 			s.Close()
 			return nil, e
 		}
 	}
 	return s, nil
+}
+
+// upgrade makes state written before layer-scoped revisions readable. Those
+// states only stored the current document; it becomes the retained base for
+// the next edit, and older edits fail with an explicit conflict instead of a
+// silent overwrite.
+func upgrade(s *model.State) {
+	if s.Revisions == nil {
+		s.Revisions = map[string][]model.SceneRevision{}
+	}
+	for id, v := range s.Scenes {
+		if len(s.Revisions[id]) == 0 {
+			s.Revisions[id] = []model.SceneRevision{{Revision: v.Revision, Name: v.Name, Document: v.Document}}
+		}
+	}
 }
 func (s *Store) Close() error {
 	if s.lock == nil {

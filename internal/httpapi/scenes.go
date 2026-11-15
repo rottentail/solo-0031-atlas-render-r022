@@ -24,6 +24,19 @@ func (a API) putScene(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, v)
 }
+func (a API) editScene(w http.ResponseWriter, r *http.Request) {
+	var body model.SceneEdit
+	if e := decode(w, r, &body); e != nil {
+		fail(w, e)
+		return
+	}
+	v, e := a.Service.EditScene(r.PathValue("id"), body)
+	if e != nil {
+		fail(w, e)
+		return
+	}
+	write(w, 200, v)
+}
 func (a API) getScene(w http.ResponseWriter, r *http.Request) {
 	v, ok := a.Service.Store.Read().Scenes[r.PathValue("id")]
 	if !ok {
@@ -50,13 +63,20 @@ func (a API) sceneState(w http.ResponseWriter, r *http.Request) {
 }
 func (a API) freeze(w http.ResponseWriter, r *http.Request) {
 	var b struct {
-		Expected int `json:"expectedRevision"`
+		Expected int              `json:"expectedRevision"`
+		Edit     *model.SceneEdit `json:"edit,omitempty"`
 	}
 	if e := decode(w, r, &b); e != nil {
 		fail(w, e)
 		return
 	}
-	v, e := a.Service.Freeze(r.PathValue("id"), b.Expected)
+	var v model.Snapshot
+	var e error
+	if b.Edit != nil {
+		v, e = a.Service.FreezeEdit(r.PathValue("id"), b.Expected, *b.Edit)
+	} else {
+		v, e = a.Service.Freeze(r.PathValue("id"), b.Expected)
+	}
 	if e != nil {
 		fail(w, e)
 		return

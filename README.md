@@ -17,6 +17,7 @@ go run ./cmd/atlas
 
 ```sh
 python3 scripts/walkthrough.py --workflow submit-render --out var/demo
+python3 scripts/walkthrough.py --workflow merge-scene-edits
 python3 scripts/walkthrough.py --workflow retire-asset
 python3 scripts/walkthrough.py --workflow cancel-render
 python3 scripts/walkthrough.py --workflow retry-render
@@ -30,9 +31,10 @@ python3 scripts/walkthrough.py --workflow compare-renders
 ## 场景到结果
 
 1. `PUT /v1/scenes/emblem`，提交名称、`expectedRevision: 0` 和 `document`。示例见 `examples/emblem.json`。
-2. `POST /v1/scenes/emblem/snapshots`，提交 `expectedRevision`，取得快照 ID。
-3. `POST /v1/jobs`，提交 `snapshotId`、`scale: 1`，并带唯一的 `Idempotency-Key` 请求头。
-4. `GET /v1/jobs/{id}` 等待 `succeeded`，再读取 `GET /v1/artifacts/{artifactId}`。
+2. 之后的修改可改用 `PATCH /v1/scenes/emblem`，只提交改过的图层、`deleteLayers` 或 `order`；基线较旧时服务会合并到当前修订，同图层冲突返回 409 明细。
+3. `POST /v1/scenes/emblem/snapshots`，提交 `expectedRevision`，取得快照 ID；也可以同时带 `edit`，在一次事务里合并并冻结。
+4. `POST /v1/jobs`，提交 `snapshotId`、`scale: 1`，并带唯一的 `Idempotency-Key` 请求头。
+5. `GET /v1/jobs/{id}` 等待 `succeeded`，再读取 `GET /v1/artifacts/{artifactId}`。
 
 同一幂等键和同一请求返回原任务；同键不同请求返回 409。快照包含引用素材的字节，后续场景编辑或素材退役不改变它。撤回快照会阻止新工作，已接受的任务仍使用固定输入。任务取消和结果提交竞争同一个持久状态；终态完成后不可取消。
 

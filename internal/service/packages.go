@@ -38,6 +38,7 @@ func (s *Service) Import(id, name string, p bundle.Package) (model.Scene, error)
 		}
 		out = model.Scene{ID: id, Name: name, Revision: 1, State: "active", Document: p.Snapshot.Document, UpdatedAt: time.Now().UTC()}
 		st.Scenes[id] = out
+		recordRevision(st, out)
 		st.Emit("scene.imported", id)
 		return nil
 	})
